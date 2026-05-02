@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-csv_to_gcal.py — Extract shifts for one person from a Wochenplan CSV
-and export them as a Google Calendar-importable .ics file.
-
-Usage:
-    python3 csv_to_gcal.py --csv KW18.csv --name "Name"
-    python3 csv_to_gcal.py --csv KW18.csv --name "Name" --out kalender.ics
+Streamlit web UI for csv_to_gcal.py
+Allows users to upload CSV files and generate calendar exports through a web interface.
 """
 
-import argparse
+import streamlit as st
 import csv
-import sys
 import uuid
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional
+import io
 
 
 # ---------------------------------------------------------------------------
-# Bezeichnung → calendar event title
-# None = skip (no entry created)
+# Classification logic (same as csv_to_gcal.py)
 # ---------------------------------------------------------------------------
 
-def classify(bezeichnung: str) -> str | None:
+def classify(bezeichnung: str) -> Optional[str]:
     b = bezeichnung.strip()
 
     # Skip regular weekday shifts
@@ -66,7 +62,7 @@ def classify(bezeichnung: str) -> str | None:
     if b in ABSENZ_TYPES:
         return "FREI"
 
-    # Unknown — caller will warn
+    # Unknown
     return "UNKNOWN:" + b
 
 
@@ -96,13 +92,15 @@ def make_event(title: str, start: date, end_inclusive: date) -> str:
 # Core logic
 # ---------------------------------------------------------------------------
 
-def load_csv(path: str) -> list[dict]:
+def load_csv_from_upload(uploaded_file) -> list[dict]:
+    """Load CSV from Streamlit uploaded file."""
     rows = []
     for encoding in ("utf-8", "iso-8859-1"):
         try:
-            with open(path, encoding=encoding, newline="") as f:
-                reader = csv.DictReader(f, delimiter=";")
-                rows = list(reader)
+            uploaded_file.seek(0)
+            content = uploaded_file.read().decode(encoding)
+            reader = csv.DictReader(io.StringIO(content), delimiter=";")
+            rows = list(reader)
             break
         except UnicodeDecodeError:
             continue
@@ -249,74 +247,103 @@ def build_ics(events: list[tuple[str, date, date]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Streamlit UI
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Export Wochenplan shifts to Google Calendar ICS.")
-    parser.add_argument("--csv", required=True, help="Path to the Wochenplan CSV file")
-    parser.add_argument("--name", required=True, help="Person name to filter (partial match on Suchname)")
-    parser.add_argument("--out", default=None, help="Output .ics file path (default: <name>.ics)")
-    parser.add_argument(
-        "--filter",
-        choices=["dienste", "absenzen"],
-        default=None,
-        help="Filter events: 'dienste' (WOCHENENDDIENST, NACHTDIENST, HINTERGRUND, SPÄTDIENST) or 'absenzen' (FREI, FORTBILDUNG)"
-    )
-    args = parser.parse_args()
+    st.set_page_config(page_title="Wochenplan to Google Calendar", page_icon="📅")
+    
+    st.title("📅 Wochenplan to Google Calendar")
+    st.write("Convert your shift schedule CSV to a Google Calendar ICS file")
+    
+    # File upload
+    uploaded_file = st.file_uploader("Upload Wochenplan CSV", type=["csv"])
+    
+    if uploaded_file is not None:
+        # Load CSV
+        rows = load_csv_from_upload(uploaded_file)
+        
+        if not rows:
+            st.error("Could not read CSV file. Please check the file format.")
+            return
+        
+        # Get available names
+        available_names = sorted({r["Suchname"].strip() for r in rows})
+        
+        # Name selection
+        selected_name = st.selectbox(
+            "Select person",
+            options=available_names,
+            help="Choose the person whose shifts you want to export"
+        )
+        
+        # Filter selection
+        filter_option = st.radio(
+            "Export filter",
+            options=["All events", "Dienste only", "Absenzen only"],
+            help="Dienste: WOCHENENDDIENST, NACHTDIENST, HINTERGRUND, SPÄTDIENST | Absenzen: FREI, FORTBILDUNG"
+        )
+        
+        # Process button
+        if st.button("Generate Calendar", type="primary"):
+            person_rows = find_person_rows(rows, selected_name)
+            
+            if not person_rows:
+                st.error(f"No entries found for '{selected_name}'")
+                return
+            
+            st.success(f"Found {len(person_rows)} entries for: {selected_name}")
+            
+            # Build events
+            events, warnings = build_events(person_rows)
+            
+            # Apply filter
+            if filter_option == "Dienste only":
+                dienste_types = {"WOCHENENDDIENST", "NACHTDIENST", "HINTERGRUND", "SPÄTDIENST"}
+                events = [(title, start, end) for title, start, end in events if title in dienste_types]
+            elif filter_option == "Absenzen only":
+                absenzen_types = {"FREI", "FORTBILDUNG"}
+                events = [(title, start, end) for title, start, end in events if title in absenzen_types]
+            
+            # Show warnings
+            if warnings:
+                with st.expander(f"⚠️ {len(warnings)} unknown Bezeichnung(en) were skipped"):
+                    for w in warnings:
+                        st.write(f"- {w}")
+                    st.info("These entries were not recognized and will not appear in the calendar.")
+            
+            if not events:
+                st.warning("No calendar entries to export (all shifts are regular weekday Tagdienst or filtered out).")
+                return
+            
+            # Show event summary
+            st.subheader(f"Events to export ({len(events)})")
 
-    rows = load_csv(args.csv)
-    if not rows:
-        print(f"ERROR: Could not read CSV file: {args.csv}", file=sys.stderr)
-        sys.exit(1)
+            # Build compact list as single markdown string
+            event_lines = []
+            for title, start, end in events:
+                if start == end:
+                    event_lines.append(f"📌 {start.strftime('%d.%m.%Y')} — **{title}**")
+                else:
+                    event_lines.append(f"📌 {start.strftime('%d.%m.%Y')} – {end.strftime('%d.%m.%Y')} — **{title}**")
 
-    person_rows = find_person_rows(rows, args.name)
-    if not person_rows:
-        print(f"ERROR: No entries found for '{args.name}'. Check spelling.", file=sys.stderr)
-        # Show available names to help
-        names = sorted({r["Suchname"].strip() for r in rows})
-        print("Available names:", file=sys.stderr)
-        for n in names:
-            print(f"  {n}", file=sys.stderr)
-        sys.exit(1)
+            st.markdown("<small>" + "<br>".join(event_lines) + "</small>", unsafe_allow_html=True)
 
-    matched_name = person_rows[0]["Suchname"].strip()
-    print(f"Found {len(person_rows)} entries for: {matched_name}")
-
-    events, warnings = build_events(person_rows)
-
-    # Apply filter if specified
-    if args.filter:
-        if args.filter == "dienste":
-            dienste_types = {"WOCHENENDDIENST", "NACHTDIENST", "HINTERGRUND", "SPÄTDIENST"}
-            events = [(title, start, end) for title, start, end in events if title in dienste_types]
-        elif args.filter == "absenzen":
-            absenzen_types = {"FREI", "FORTBILDUNG"}
-            events = [(title, start, end) for title, start, end in events if title in absenzen_types]
-
-    if warnings:
-        print(f"\nWARNING: {len(warnings)} unknown Bezeichnung(en) were skipped:")
-        for w in warnings:
-            print(f"  - {w}")
-        print("Add them to the classify() function in csv_to_gcal.py to handle them.\n")
-
-    if not events:
-        print("No calendar entries to export (all shifts are regular weekday Tagdienst).")
-        sys.exit(0)
-
-    # Print summary
-    print(f"\nEvents to export ({len(events)}):")
-    for title, start, end in events:
-        if start == end:
-            print(f"  {start.strftime('%d.%m.%Y')}  {title}")
-        else:
-            print(f"  {start.strftime('%d.%m.%Y')} – {end.strftime('%d.%m.%Y')}  {title}")
-
-    # Write ICS
-    out_path = args.out or f"{matched_name.replace(' ', '_')}.ics"
-    ics_content = build_ics(events)
-    Path(out_path).write_text(ics_content, encoding="utf-8")
-    print(f"\nSaved: {out_path}")
+            # Generate ICS
+            ics_content = build_ics(events)
+            
+            # Download button
+            filename = f"{selected_name.replace(' ', '_')}.ics"
+            st.download_button(
+                label="⬇️ Download ICS file",
+                data=ics_content,
+                file_name=filename,
+                mime="text/calendar",
+                type="primary"
+            )
+            
+            st.success("Calendar file ready! Click the button above to download.")
+            st.info("💡 Import the .ics file into Google Calendar, Apple Calendar, or Outlook.")
 
 
 if __name__ == "__main__":
