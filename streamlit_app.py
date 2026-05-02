@@ -283,9 +283,9 @@ def build_events(
         # Flush final block
         type_blocks.append((event_type, cur_start, cur_end))
 
-        # For FREI blocks: filter out standalone weekend blocks when merge is DISABLED
-        # When merge is ENABLED, weekends are included via bridging, so no filtering needed
-        if event_type == "FREI" and not merge_frei_weekends:
+        # For FREI blocks: always filter out standalone weekend blocks
+        # Weekends should only appear if they're adjacent to or bridge weekday FREI
+        if event_type == "FREI":
             for block_start, block_end in [(b[1], b[2]) for b in type_blocks]:
                 # Check if block contains any weekday
                 has_weekday = False
@@ -300,7 +300,7 @@ def build_events(
                 if has_weekday:
                     blocks.append((event_type, block_start, block_end))
         else:
-            # Non-FREI blocks or merge_frei_weekends enabled: keep all
+            # Non-FREI blocks: keep all
             blocks.extend(type_blocks)
 
     return blocks, warnings
