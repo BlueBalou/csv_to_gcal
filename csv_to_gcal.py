@@ -45,8 +45,9 @@ def classify(bezeichnung: str) -> str | None:
     # Night shifts
     if "Nachtdienst" in b:
         return "NACHTDIENST"
-    if "Pikett_Nacht" in b:
-        return "NACHTDIENST"
+    
+    if "Pikett_Nacht_Mo-Fr" in b:
+        return "HINTERGRUND"
 
     # Late shift
     if "Spätdienst" in b or "Spatdienst" in b:
@@ -125,9 +126,12 @@ def build_events(person_rows: list[dict]) -> tuple[list[tuple], list[str]]:
     events = list of (title, start_date, end_date_inclusive)
     warnings = list of unknown Bezeichnung strings
     """
-    # Collect (date, title) pairs, skip None
-    day_entries: dict[date, str] = {}
+    # Collect (date, list of titles) pairs, skip None
+    day_entries: dict[date, list[str]] = {}
     warnings = []
+
+    def is_weekend(d: date) -> bool:
+        return d.weekday() >= 5  # 5=Sat, 6=Sun
 
     for row in person_rows:
         bezeichnung = row["Bezeichnung"].strip()
@@ -142,72 +146,89 @@ def build_events(person_rows: list[dict]) -> tuple[list[tuple], list[str]]:
                 warnings.append(unknown)
             continue
 
-        # If multiple entries on same day, prefer non-FREI
+        # Allow multiple entries per day
         if d in day_entries:
-            existing = day_entries[d]
-            if existing == "FREI" and title != "FREI":
-                day_entries[d] = title
+            if title not in day_entries[d]:  # Avoid duplicates
+                day_entries[d].append(title)
         else:
-            day_entries[d] = title
+            day_entries[d] = [title]
 
     if not day_entries:
         return [], warnings
 
-    # Sort by date
-    sorted_days = sorted(day_entries.items())
-
     # ---------------------------------------------------------------------------
-    # Merge consecutive same-type entries, with FREI weekend-bridge rule:
-    # If a FREI block is separated from another FREI block only by Sat/Sun
-    # with no other entries on those days, merge them.
+    # Process each event type separately to build blocks
+    # FREI gets special treatment: remove standalone weekend blocks not adjacent to weekday FREI
     # ---------------------------------------------------------------------------
 
-    def is_weekend(d: date) -> bool:
-        return d.weekday() >= 5  # 5=Sat, 6=Sun
+    # Collect all unique event types
+    all_titles = set()
+    for titles_list in day_entries.values():
+        all_titles.update(titles_list)
 
-    def weekend_between_has_no_other_entries(
-        end1: date, start2: date, all_dates: set[date]
-    ) -> bool:
-        """Check that all dates between end1 and start2 are weekends not in entries."""
-        d = end1 + timedelta(days=1)
-        while d < start2:
-            if not is_weekend(d):
-                return False
-            if d in all_dates:
-                return False
-            d += timedelta(days=1)
-        return True
+    blocks: list[tuple[str, date, date]] = []
 
-    all_entry_dates = {d for d, _ in sorted_days}
-
-    # Build merged blocks
-    blocks: list[tuple[str, date, date]] = []  # (title, start, end_inclusive)
-
-    cur_title, cur_start, cur_end = sorted_days[0][1], sorted_days[0][0], sorted_days[0][0]
-
-    for d, title in sorted_days[1:]:
-        gap_days = (d - cur_end).days
-
-        # Direct consecutive same type
-        if title == cur_title and gap_days == 1:
-            cur_end = d
+    # Process each event type separately
+    for event_type in sorted(all_titles):
+        # Get all dates for this event type
+        dates_for_type = sorted([d for d, titles in day_entries.items() if event_type in titles])
+        
+        if not dates_for_type:
             continue
+        
+        # Build blocks for this event type
+        cur_start = dates_for_type[0]
+        cur_end = dates_for_type[0]
+        type_blocks = []
 
-        # FREI weekend bridge: gap is 2 or 3 days (Sat+Sun or Fri+Sat+Sun)
-        if (
-            title == "FREI"
-            and cur_title == "FREI"
-            and 1 < gap_days <= 3
-            and weekend_between_has_no_other_entries(cur_end, d, all_entry_dates)
-        ):
+        for d in dates_for_type[1:]:
+            gap_days = (d - cur_end).days
+
+            # Consecutive days or weekend gap that should be bridged
+            if gap_days == 1:
+                cur_end = d
+                continue
+            
+            # For FREI: bridge across weekends (2-3 day gaps that are only weekends)
+            if event_type == "FREI" and 1 < gap_days <= 3:
+                all_weekend = True
+                check_date = cur_end + timedelta(days=1)
+                while check_date < d:
+                    if not is_weekend(check_date):
+                        all_weekend = False
+                        break
+                    check_date += timedelta(days=1)
+                
+                if all_weekend:
+                    cur_end = d
+                    continue
+
+            # Gap too large - flush current block
+            type_blocks.append((event_type, cur_start, cur_end))
+            cur_start = d
             cur_end = d
-            continue
 
-        # Flush current block
-        blocks.append((cur_title, cur_start, cur_end))
-        cur_title, cur_start, cur_end = title, d, d
+        # Flush final block
+        type_blocks.append((event_type, cur_start, cur_end))
 
-    blocks.append((cur_title, cur_start, cur_end))
+        # For FREI blocks: filter out standalone weekend blocks
+        if event_type == "FREI":
+            for block_start, block_end in [(b[1], b[2]) for b in type_blocks]:
+                # Check if block contains any weekday
+                has_weekday = False
+                check_date = block_start
+                while check_date <= block_end:
+                    if not is_weekend(check_date):
+                        has_weekday = True
+                        break
+                    check_date += timedelta(days=1)
+                
+                # Only keep blocks that have at least one weekday
+                if has_weekday:
+                    blocks.append((event_type, block_start, block_end))
+        else:
+            # Non-FREI blocks: keep all
+            blocks.extend(type_blocks)
 
     return blocks, warnings
 
